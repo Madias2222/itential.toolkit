@@ -1,0 +1,120 @@
+---
+- name: "Running backup task on {{ inventory_hostname }} (SFTP)"
+  debug:
+    msg: "This host is running the MongoDB SFTP backup."
+
+- name: Try to create backup directory and give friendly advice if it fails
+  block:
+    - name: Check if backup directory exists
+      stat:
+        path: "{{ mongo_backup_dir }}"
+      register: backup_dir_stat
+
+    - name: Create backup directory if not present
+      become: true
+      file:
+        path: "{{ mongo_backup_dir }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        mode: 0755
+      when: not backup_dir_stat.stat.exists
+
+  rescue:
+    - name: Fail with friendly message if cannot create backup dir
+      fail:
+        msg: |
+          Failed to create backup directory {{ mongo_backup_dir }} as user {{ ansible_user }}.
+          You must either:
+            1. Pre-create this directory and make it writable for {{ ansible_user }},
+            2. Re-run the playbook with -K (become/sudo).
+          Example:
+            ansible-playbook -i inventory.yml playbooks/mongo-backup.yml -K
+
+- name: Set backup filename
+  set_fact:
+    backup_filename: "mongo_backup_{{ lookup('pipe', 'date +%Y%m%dT%H%M%S') }}.gz"
+
+- name: Set local backup file path
+  set_fact:
+    local_backup_file: "{{ mongo_backup_dir }}/{{ backup_filename }}"
+
+- import_role:
+    name: mongo_common
+    tasks_from: set_tls_vars
+
+- name: Copy dump.sh to remote host
+  copy:
+    src: dump.sh
+    dest: /tmp/dump.sh
+    mode: 0755
+
+- name: Run mongodump via helper script
+  shell: |
+    "/tmp/dump.sh" \
+      "{{ mongo_dump_user }}" \
+      "{{ mongo_dump_pass }}" \
+      "{{ mongo_auth_db }}" \
+      "{{ mongo_db | default('') }}" \
+      "{{ local_backup_file }}" \
+      "{{ '--oplog' if mongo_backup_all | default(false) | bool else '' }}" \
+      "{{ mongo_tls_args | default('') }}" \
+      "{{ inventory_hostname }}"
+  args:
+    executable: /bin/bash
+  register: dump_local
+  failed_when: dump_local.rc != 0
+
+- name: Upload backup file via SFTP (password)
+  shell: |
+    sshpass -p '{{ scp_pass }}' sftp -oBatchMode=no -oStrictHostKeyChecking=no -P {{ scp_port | default(22) }} {{ scp_user }}@{{ scp_host }} <<EOF
+    put {{ local_backup_file }} {{ scp_backup_dir }}/{{ backup_filename }}
+    EOF
+  args:
+    executable: /bin/bash
+  environment:
+    SSHPASS: "{{ scp_pass }}"
+  register: sftp_result
+  failed_when: sftp_result.rc != 0
+  changed_when: sftp_result.rc == 0
+  no_log: false
+  when: scp_auth == "password"
+
+- name: Check if SSH key exists on remote host (if using key)
+  stat:
+    path: "{{ scp_key }}"
+  register: sftp_key_stat
+  when: scp_auth == "key"
+
+- name: Fail if SSH key is missing for SFTP
+  fail:
+    msg: |
+      SFTP key authentication selected, but the key file ({{ scp_key }}) is not present or not readable on {{ inventory_hostname }}.
+      Please ensure the key is available at the specified path on the MongoDB host.
+  when:
+    - scp_auth == "key"
+    - not sftp_key_stat.stat.exists
+
+- name: Upload backup file via SFTP (key)
+  shell: |
+    sftp -i {{ scp_key | quote }} -oBatchMode=yes -oStrictHostKeyChecking=no -P {{ scp_port | default(22) }} {{ scp_user }}@{{ scp_host }} <<EOF
+    put {{ local_backup_file }} {{ scp_backup_dir }}/{{ backup_filename }}
+    EOF
+  args:
+    executable: /bin/bash
+  register: sftp_result
+  failed_when: sftp_result.rc != 0
+  changed_when: sftp_result.rc == 0
+  no_log: false
+  when:
+    - scp_auth == "key"
+    - sftp_key_stat.stat.exists
+
+- name: Debug SFTP upload
+  debug:
+    msg: "Backup uploaded to SFTP server: {{ scp_host }}:{{ scp_backup_dir }}/{{ backup_filename }}"
+
+- name: Remove local backup file after upload (optional)
+  file:
+    path: "{{ local_backup_file }}"
+    state: absent
+  when: cleanup_local_backup | default(true)

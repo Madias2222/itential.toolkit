@@ -1,0 +1,69 @@
+---
+- name: "Running backup task on {{ inventory_hostname }} (local)"
+  debug:
+    msg: "This host is running the MongoDB local backup."
+
+- name: Try to create backup directory and give friendly advice if it fails
+  block:
+    - name: Check if backup directory exists
+      stat:
+        path: "{{ mongo_backup_dir }}"
+      register: backup_dir_stat
+
+    - name: Create backup directory if not present
+      become: true
+      file:
+        path: "{{ mongo_backup_dir }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        mode: 0755
+      when: not backup_dir_stat.stat.exists
+
+  rescue:
+    - name: Fail with friendly message if cannot create backup dir
+      fail:
+        msg: |
+          Failed to create backup directory {{ mongo_backup_dir }} as user {{ ansible_user }}.
+          You must either:
+            1. Pre-create this directory and make it writable for {{ ansible_user }}, or
+            2. Re-run the playbook with -K (become/sudo) to let Ansible create it for you.
+          Example:
+            ansible-playbook -i inventory.yml playbooks/mongo-backup.yml -K
+
+- name: Set backup filename
+  set_fact:
+    backup_filename: "mongo_backup_{{ lookup('pipe', 'date +%Y%m%dT%H%M%S') }}.gz"
+
+- name: Set local backup file path
+  set_fact:
+    local_backup_file: "{{ mongo_backup_dir }}/{{ backup_filename }}"
+
+- import_role:
+    name: mongo_common
+    tasks_from: set_tls_vars
+
+- name: Copy dump.sh to remote host
+  copy:
+    src: dump.sh
+    dest: /tmp/dump.sh
+    mode: 0755
+
+- name: Run mongodump via helper script
+  shell: |
+    "/tmp/dump.sh" \
+      "{{ mongo_dump_user }}" \
+      "{{ mongo_dump_pass }}" \
+      "{{ mongo_auth_db }}" \
+      "{{ mongo_db | default('') }}" \
+      "{{ local_backup_file }}" \
+      "{{ '--oplog' if mongo_backup_all | default(false) | bool else '' }}" \
+      "{{ mongo_tls_args | default('') }}" \
+      "{{ inventory_hostname }}"
+  args:
+    executable: /bin/bash
+  register: dump_local
+  failed_when: dump_local.rc != 0
+
+- name: Debug local backup location
+  debug:
+    msg: "Local backup saved to {{ local_backup_file }}"

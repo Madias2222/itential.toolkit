@@ -1,0 +1,110 @@
+---
+- name: "Running restore task on {{ inventory_hostname }} (SSH stream)"
+  debug:
+    msg: "This host is running the MongoDB restore via SSH streaming."
+
+# If filename not provided, get latest from backup server
+- name: "Find latest backup file on remote backup server (SSH)"
+  shell: |
+    {% if scp_auth == "key" %}
+      ssh -i {{ scp_key | quote }} -o BatchMode=yes -o StrictHostKeyChecking=no -p {{ scp_port | default(22) }} \
+        {{ scp_user }}@{{ scp_host }} \
+        'ls -1t {{ scp_backup_dir }}/mongo_backup_*.gz | head -n1'
+    {% else %}
+      sshpass -p '{{ scp_pass }}' ssh -o BatchMode=no -o StrictHostKeyChecking=no -p {{ scp_port | default(22) }} \
+        {{ scp_user }}@{{ scp_host }} \
+        'ls -1t {{ scp_backup_dir }}/mongo_backup_*.gz | head -n1'
+    {% endif %}
+  args:
+    executable: /bin/bash
+  register: latest_backup_file
+  when: restore_filename is not defined or not restore_filename
+  changed_when: false
+
+- name: "Set restore_filename to latest found (SSH)"
+  set_fact:
+    restore_filename: "{{ latest_backup_file.stdout | basename | trim }}"
+  when: restore_filename is not defined or not restore_filename
+
+# Optional: fail clearly if key missing (no perms fiddling)
+- name: Check SSH key exists (SSH stream key auth)
+  stat:
+    path: "{{ scp_key | default('') }}"
+  register: ssh_key_stat
+  when: scp_auth == "key"
+
+- name: Fail if SSH key not found (SSH stream)
+  fail:
+    msg: "SSH key auth selected but key file not found at {{ scp_key }}."
+  when: scp_auth == "key" and (not ssh_key_stat.stat.exists or not ssh_key_stat.stat.isreg)
+
+# Build flags safely
+- name: Set restore flags (oplog + drop)
+  set_fact:
+    restore_flag_oplog: >-
+      {{ '--oplogReplay'
+         if (mongo_db | default('') | trim == '')
+            and (mongo_backup_all | default(false) | bool)
+            and (restore_with_oplog | default(false) | bool)
+         else '' }}
+    restore_flag_drop: "{{ '--drop' if mongo_restore_drop | default(false) | bool else '' }}"
+
+- name: Combine extra flags for mongorestore
+  set_fact:
+    mongorestore_extra_flags: "{{ [restore_flag_oplog, restore_flag_drop] | reject('equalto','') | join(' ') }}"
+
+- name: Copy restore.sh to remote host
+  copy:
+    src: restore.sh
+    dest: /tmp/restore.sh
+    mode: '0755'
+
+# Password stream
+- name: Run mongorestore via SSH stream (password)
+  shell: |
+    sshpass -p '{{ scp_pass }}' ssh -o BatchMode=no -o StrictHostKeyChecking=no -p {{ scp_port | default(22) }} \
+      {{ scp_user }}@{{ scp_host }} \
+      'gunzip -c {{ scp_backup_dir }}/{{ restore_filename }}' \
+    | "/tmp/restore.sh" \
+        "{{ mongo_dump_user }}" \
+        "{{ mongo_dump_pass }}" \
+        "{{ mongo_auth_db }}" \
+        "{{ mongo_db | default('') }}" \
+        "-" \
+        "{{ mongo_tls_args | default('') | trim }}" \
+        "{{ mongorestore_extra_flags | default('') | trim }}"
+  args:
+    executable: /bin/bash
+  register: restore_ssh_pwd
+  failed_when: restore_ssh_pwd.rc != 0
+  changed_when: restore_ssh_pwd.rc == 0
+  no_log: true
+  when: scp_auth == "password"
+
+# Key stream
+- name: Run mongorestore via SSH stream (key)
+  shell: |
+    ssh -i {{ scp_key | quote }} -o BatchMode=yes -o StrictHostKeyChecking=no -p {{ scp_port | default(22) }} \
+      {{ scp_user }}@{{ scp_host }} \
+      'gunzip -c {{ scp_backup_dir }}/{{ restore_filename }}' \
+    | "/tmp/restore.sh" \
+        "{{ mongo_dump_user }}" \
+        "{{ mongo_dump_pass }}" \
+        "{{ mongo_auth_db }}" \
+        "{{ mongo_db | default('') }}" \
+        "-" \
+        "{{ mongo_tls_args | default('') | trim }}" \
+        "{{ mongorestore_extra_flags | default('') | trim }}"
+  args:
+    executable: /bin/bash
+  register: restore_ssh_key
+  failed_when: restore_ssh_key.rc != 0
+  changed_when: restore_ssh_key.rc == 0
+  no_log: true
+  when: scp_auth == "key"
+
+- name: Debug SSH restore result
+  debug:
+    msg: >-
+      Restore via SSH stream finished:
+      {{ (restore_ssh_pwd if scp_auth == 'password' else restore_ssh_key) }}

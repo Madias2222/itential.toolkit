@@ -1,0 +1,126 @@
+---
+- name: "Running restore task on {{ inventory_hostname }} (SFTP)"
+  debug:
+    msg: "This host is running the MongoDB restore via SFTP download."
+
+# Ensure temp dir exists
+- name: Ensure restore_temp_dir exists (if not /tmp)
+  file:
+    path: "{{ restore_temp_dir | default('/tmp') }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    mode: 0755
+  when: restore_temp_dir | default('/tmp') != '/tmp'
+
+# If filename not provided, get latest from backup server
+- name: "Find latest backup file on remote backup server (for SFTP)"
+  shell: |
+    {% if scp_auth == "key" %}
+      ssh -i {{ scp_key | quote }} -o BatchMode=yes -o StrictHostKeyChecking=no -p {{ scp_port | default(22) }} \
+        {{ scp_user }}@{{ scp_host }} \
+        'ls -1t {{ scp_backup_dir }}/mongo_backup_*.gz | head -n1'
+    {% else %}
+      sshpass -p '{{ scp_pass }}' ssh -o BatchMode=no -o StrictHostKeyChecking=no -p {{ scp_port | default(22) }} \
+        {{ scp_user }}@{{ scp_host }} \
+        'ls -1t {{ scp_backup_dir }}/mongo_backup_*.gz | head -n1'
+    {% endif %}
+  args:
+    executable: /bin/bash
+  register: latest_backup_file
+  when: restore_filename is not defined or not restore_filename
+  changed_when: false
+
+- name: "Set restore_filename to latest found (SFTP)"
+  set_fact:
+    restore_filename: "{{ latest_backup_file.stdout | basename | trim }}"
+  when: restore_filename is not defined or not restore_filename
+
+- name: Set restore_temp_file path for download
+  set_fact:
+    restore_temp_file: "{{ (restore_temp_dir | default('/tmp')) | trim }}/{{ restore_filename }}"
+
+# Optional: fail clearly if key missing (no perms fiddling)
+- name: Check SSH key exists (SFTP key auth)
+  stat:
+    path: "{{ scp_key | default('') }}"
+  register: sftp_key_stat
+  when: scp_auth == "key"
+
+- name: Fail if SSH key not found (SFTP)
+  fail:
+    msg: "SFTP key auth selected but key file not found at {{ scp_key }}."
+  when: scp_auth == "key" and (not sftp_key_stat.stat.exists or not sftp_key_stat.stat.isreg)
+
+# Download via SFTP
+- name: Download backup via SFTP (password)
+  shell: |
+    sshpass -p '{{ scp_pass }}' sftp -o BatchMode=no -o StrictHostKeyChecking=no -P {{ scp_port | default(22) }} \
+      {{ scp_user }}@{{ scp_host }} <<'EOF'
+    get {{ scp_backup_dir }}/{{ restore_filename }} {{ restore_temp_file }}
+    EOF
+  args:
+    executable: /bin/bash
+  environment:
+    SSHPASS: "{{ scp_pass }}"
+  register: sftp_get_pwd
+  failed_when: sftp_get_pwd.rc != 0
+  changed_when: sftp_get_pwd.rc == 0
+  no_log: false
+  when: scp_auth == "password"
+
+- name: Download backup via SFTP (key)
+  shell: |
+    sftp -i {{ scp_key | quote }} -o BatchMode=yes -o StrictHostKeyChecking=no -P {{ scp_port | default(22) }} \
+      {{ scp_user }}@{{ scp_host }} <<'EOF'
+    get {{ scp_backup_dir }}/{{ restore_filename }} {{ restore_temp_file }}
+    EOF
+  args:
+    executable: /bin/bash
+  register: sftp_get_key
+  failed_when: sftp_get_key.rc != 0
+  changed_when: sftp_get_key.rc == 0
+  no_log: false
+  when: scp_auth == "key"
+
+# Build flags safely
+- name: Set restore flags (oplog + drop)
+  set_fact:
+    restore_flag_oplog: >-
+      {{ '--oplogReplay'
+         if (mongo_db | default('') | trim == '')
+            and (mongo_backup_all | default(false) | bool)
+            and (restore_with_oplog | default(false) | bool)
+         else '' }}
+    restore_flag_drop: "{{ '--drop' if mongo_restore_drop | default(false) | bool else '' }}"
+
+- name: Combine extra flags for mongorestore
+  set_fact:
+    mongorestore_extra_flags: "{{ [restore_flag_oplog, restore_flag_drop] | reject('equalto','') | join(' ') }}"
+
+- name: Copy restore.sh to remote host
+  copy:
+    src: restore.sh
+    dest: /tmp/restore.sh
+    mode: '0755'
+
+- name: Run mongorestore via helper script (SFTP local file)
+  shell: |
+    "/tmp/restore.sh" \
+      "{{ mongo_dump_user }}" \
+      "{{ mongo_dump_pass }}" \
+      "{{ mongo_auth_db }}" \
+      "{{ mongo_db | default('') }}" \
+      "{{ restore_temp_file }}" \
+      "{{ mongo_tls_args | default('') | trim }}" \
+      "{{ mongorestore_extra_flags | default('') | trim }}"
+  args:
+    executable: /bin/bash
+  register: restore_sftp_run
+  changed_when: restore_sftp_run.rc == 0
+  failed_when: restore_sftp_run.rc != 0
+  no_log: false
+
+- name: Remove restore temp file
+  file:
+    path: "{{ restore_temp_file }}"
+    state: absent

@@ -1,0 +1,12 @@
+---
+- name: List backups in remote SFTP directory (latest first)
+  shell: |
+    sshpass -p '{{ scp_pass }}' sftp -oBatchMode=no -oStrictHostKeyChecking=no -P {{ scp_port }} {{ scp_user }}@{{ scp_host }} <<EOF
+    ls -t {{ scp_backup_dir }}
+    EOF
+  register: sftp_backup_list
+
+- name: Set latest backup file
+  set_fact:
+    restore_file: "{{ sftp_backup_list.stdout_lines[1] | trim }}"
+  when: restore_file is not defined or restore_file == ""

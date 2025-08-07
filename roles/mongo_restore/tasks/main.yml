@@ -1,0 +1,17 @@
+---
+- name: "Select restore method"
+  debug:
+    msg: "Restore method: {{ restore_method }}"
+
+- include_role:
+    name: mongo_common
+    tasks_from: set_tls_vars
+
+- import_tasks: restore_local.yml
+  when: restore_method == "local"
+
+- import_tasks: restore_sftp.yml
+  when: restore_method == "sftp"
+
+- import_tasks: restore_ssh.yml
+  when: restore_method == "ssh"

@@ -1,0 +1,17 @@
+---
+- name: "Select backup method"
+  ansible.builtin.debug:
+    msg: "Backup method: {{ backup_method }}"
+
+- include_role:
+    name: mongo_common
+    tasks_from: set_tls_vars
+
+- import_tasks: backup_local.yml
+  when: backup_method == "local"
+
+- import_tasks: backup_sftp.yml
+  when: backup_method == "sftp"
+
+- import_tasks: backup_ssh.yml
+  when: backup_method == "ssh"

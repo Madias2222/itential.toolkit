@@ -1,0 +1,67 @@
+---
+- name: "Running backup task on {{ inventory_hostname }} (ssh)"
+  debug:
+    msg: "This host is running the MongoDB backup (streamed over SSH)."
+
+- name: "Ensure remote backup directory exists (SSH: password or key)"
+  block:
+    - name: Create remote backup directory (via SSH password or key)
+      shell: |
+        {% if scp_auth == 'password' %}
+          sshpass -p '{{ scp_pass }}' ssh -oStrictHostKeyChecking=no -p {{ scp_port | default(22) }} {{ scp_user }}@{{ scp_host }} "mkdir -p {{ scp_backup_dir }}"
+        {% else %}
+          ssh -i {{ scp_key | quote }} -oStrictHostKeyChecking=no -p {{ scp_port | default(22) }} {{ scp_user }}@{{ scp_host }} "mkdir -p {{ scp_backup_dir }}"
+        {% endif %}
+      args:
+        executable: /bin/bash
+      environment:
+        SSHPASS: "{{ scp_pass | default('') }}"
+      register: remote_dir_result
+      changed_when: remote_dir_result.rc == 0
+      failed_when: remote_dir_result.rc != 0
+
+  rescue:
+    - name: Fail with friendly message if cannot create remote dir
+      fail:
+        msg: |
+          Failed to create remote directory {{ scp_backup_dir }} on {{ scp_host }}.
+          Check SSH access, permissions, and auth configuration (scp_auth, scp_pass, scp_key).
+
+- name: Set backup filename
+  set_fact:
+    backup_filename: "mongo_backup_{{ lookup('pipe','date +%Y%m%dT%H%M%S') }}.gz"
+
+- name: Set mongodump command (with/without all DBs)
+  set_fact:
+    mongodump_cmd: >-
+      mongodump --username "{{ mongo_dump_user }}" --password "{{ mongo_dump_pass }}"
+      --authenticationDatabase "{{ mongo_auth_db }}"
+      {% if mongo_backup_all | default(false) | bool %}
+      --archive --gzip --oplog
+      {% else %}
+      --db "{{ mongo_db }}" --archive --gzip
+      {% endif %}
+      {{ mongo_tls_args | default('') }}
+      --host {{ ansible_host | default(inventory_hostname) }}
+
+- name: Stream mongodump to remote host over SSH (password or key)
+  shell: |
+    set -o pipefail
+    {{ mongodump_cmd }} | \
+    {% if scp_auth == 'password' %}
+      sshpass -p '{{ scp_pass }}' ssh -oStrictHostKeyChecking=no -p {{ scp_port | default(22) }} {{ scp_user }}@{{ scp_host }} "cat > {{ scp_backup_dir }}/{{ backup_filename }}"
+    {% else %}
+      ssh -i {{ scp_key | quote }} -oStrictHostKeyChecking=no -p {{ scp_port | default(22) }} {{ scp_user }}@{{ scp_host }} "cat > {{ scp_backup_dir }}/{{ backup_filename }}"
+    {% endif %}
+  args:
+    executable: /bin/bash
+  environment:
+    SSHPASS: "{{ scp_pass | default('') }}"
+  register: ssh_stream_result
+  changed_when: ssh_stream_result.rc == 0
+  failed_when: ssh_stream_result.rc != 0
+  no_log: true
+
+- name: Debug SSH streamed backup location
+  debug:
+    msg: "Backup streamed to {{ scp_host }}:{{ scp_backup_dir }}/{{ backup_filename }}"

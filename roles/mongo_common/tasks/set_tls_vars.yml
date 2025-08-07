@@ -1,0 +1,31 @@
+# roles/mongo_common/tasks/set_tls_vars.yml
+- name: Look up mongodump version (once per host)
+  command: mongodump --version
+  register: dump_ver
+  changed_when: false
+  failed_when: dump_ver.rc != 0
+  check_mode: false
+
+- name: Decide whether this host needs --ssl* or --tls* flags
+  set_fact:
+    mongo_tls_old_flag: "{{ (dump_ver.stdout | regex_search('version: (\\d+)\\.') | int) < 4 or
+                            (dump_ver.stdout | regex_search('version: 4\\.(\\d+)') | int) < 2 }}"
+
+- name: Build TLS/SSL argument string
+  set_fact:
+    mongo_tls_args: >-
+      {% set out = [] %}
+      {% if mongo_tls | default(false) | bool %}
+        {% set pfx = '--ssl' if mongo_tls_old_flag else '--tls' %}
+        {{ out.append(pfx) }}
+        {% if mongo_tls_ca | default('') %}
+          {{ out.append(pfx ~ 'CAFile="' ~ mongo_tls_ca ~ '"') }}
+        {% endif %}
+        {% if mongo_tls_cert | default('') %}
+          {{ out.append(pfx ~ 'CertificateKeyFile="' ~ mongo_tls_cert ~ '"') }}
+        {% endif %}
+        {% if mongo_tls_key | default('') %}
+          {{ out.append(pfx ~ 'CertificateKeyFilePassword="' ~ mongo_tls_key ~ '"') }}
+        {% endif %}
+      {% endif %}
+      {{ out | join(' ') }}

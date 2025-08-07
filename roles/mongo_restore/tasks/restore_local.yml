@@ -1,0 +1,83 @@
+---
+- name: "Running restore task on {{ inventory_hostname }} (LOCAL)"
+  debug:
+    msg: "This host is running the MongoDB restore from a local file."
+
+# Block local restore if in replica set (unless override)
+- name: Check if this node is part of a replica set
+  shell: |
+    mongosh --quiet --eval 'rs.isMaster().setName ? "true" : "false"'
+  register: is_replica_set
+
+- name: Fail if trying local restore on a replica set (unless override)
+  fail:
+    msg: |
+      Local restore is NOT supported on MongoDB replica sets.
+      Please use restore via SFTP or SSH instead.
+      (Set override_local_restore: true to force/override, at your own risk.)
+  when:
+    - is_replica_set.stdout == "true"
+    - not (override_local_restore | default(false))
+
+# If restore_file is not provided, pick latest local backup in mongo_backup_dir
+- name: "Find latest local backup (when restore_file not provided)"
+  shell: |
+    set -o pipefail
+    ls -1t {{ mongo_backup_dir | quote }}/mongo_backup_*.gz | head -n1
+  args:
+    executable: /bin/bash
+  register: latest_local_backup
+  changed_when: false
+  failed_when: latest_local_backup.rc != 0 and (restore_file is not defined or not restore_file)
+  when: restore_file is not defined or not restore_file
+
+- name: "Set restore_file to latest found (local)"
+  set_fact:
+    restore_file: "{{ latest_local_backup.stdout | trim }}"
+  when: restore_file is not defined or not restore_file
+
+# Fail if no restore file found
+- name: Fail if no restore file found
+  fail:
+    msg: |
+      No restore file was specified and none found in {{ mongo_backup_dir }}!
+      Aborting restore.
+  when: restore_file is not defined or restore_file|length == 0
+
+# Build flags safely
+- name: Set restore flags (oplog + drop)
+  set_fact:
+    restore_flag_oplog: >-
+      {{ '--oplogReplay'
+         if (mongo_db | default('') | trim == '')
+            and (mongo_backup_all | default(false) | bool)
+            and (restore_with_oplog | default(false) | bool)
+         else '' }}
+    restore_flag_drop: "{{ '--drop' if mongo_restore_drop | default(false) | bool else '' }}"
+
+- name: Combine extra flags for mongorestore
+  set_fact:
+    mongorestore_extra_flags: "{{ [restore_flag_oplog, restore_flag_drop] | reject('equalto','') | join(' ') }}"
+
+- name: Copy restore.sh to remote host
+  copy:
+    src: restore.sh
+    dest: /tmp/restore.sh
+    mode: '0755'
+
+- name: Run mongorestore via helper script (LOCAL file)
+  shell: |
+    "/tmp/restore.sh" \
+      "{{ mongo_dump_user }}" \
+      "{{ mongo_dump_pass }}" \
+      "{{ mongo_auth_db }}" \
+      "{{ mongo_db | default('') }}" \
+      "{{ restore_file }}" \
+      "{{ mongo_tls_args | default('') | trim }}" \
+      "{{ mongorestore_extra_flags | default('') | trim }}"
+  args:
+    executable: /bin/bash
+  register: restore_local_run
+  changed_when: restore_local_run.rc == 0
+  failed_when: restore_local_run.rc != 0
+  no_log: false
