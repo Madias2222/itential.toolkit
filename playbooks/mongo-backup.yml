@@ -1,0 +1,76 @@
+---
+- name: Check which hosts are secondaries
+  hosts: mongo_servers
+  gather_facts: false
+  tasks:
+    - name: Setup Mongo TLS Variables
+      import_role:
+        name: mongo_common
+        tasks_from: set_tls_vars
+
+    - name: Check if this host is secondary
+      shell: >-
+        mongosh --host {{ ansible_host | default(inventory_hostname) }}
+        {{ mongo_tls_args | default('') | trim }}
+        --quiet --eval 'rs.isMaster().secondary'
+      register: is_secondary_raw
+      args:
+        executable: /bin/bash           # keep if you already had it
+
+    - name: Set hostvar for secondary status
+      set_fact:
+        secondary_hosts_local: >-
+          {{ [inventory_hostname] if (is_secondary_raw.stdout == 'true') else [] }}
+
+- name: Select and run backup on one secondary
+  hosts: mongo_servers
+  gather_facts: false
+
+  tasks:
+    - name: Gather all secondary hostnames at group level (run_once)
+      set_fact:
+        group_secondary_hosts: >-
+          {{ ansible_play_hosts_all
+             | map('extract', hostvars, 'secondary_hosts_local')
+             | sum(start=[]) }}
+      run_once: true
+
+    - name: Decide which host should run the backup (secondary if any, else first host)
+      set_fact:
+        backup_runner_host: >-
+          {{ (group_secondary_hosts[0] | default(ansible_play_hosts_all[0])) }}
+      run_once: true
+
+    - name: Share chosen backup runner with all hosts
+      set_fact:
+        backup_runner_host: "{{ hostvars[ansible_play_hosts_all[0]].backup_runner_host }}"
+
+    - name: Mark this host as the backup candidate
+      set_fact:
+        backup_candidate: "{{ inventory_hostname == backup_runner_host }}"
+
+    - name: "Debug: Will this host run the backup?"
+      when: inventory_hostname in ansible_play_hosts_all
+      debug:
+        msg: "I am {{ inventory_hostname }}. Am I running the backup? {{ backup_candidate }} (chosen: {{ backup_runner_host }})"
+
+    - name: Detect if this host is part of a replica set
+      shell: mongosh --quiet --eval '!!db.isMaster().setName'
+      register: is_replica_set
+      when: backup_candidate | bool
+
+    - name: Set oplog_flag for backup
+      set_fact:
+        oplog_flag: >-
+          {% if is_replica_set.stdout == 'true' and mongo_backup_all | default(false) | bool %}
+          --oplog
+          {% else %}
+          {% endif %}
+      when: backup_candidate | bool
+
+    - name: Run backup role (only on chosen host)
+      include_role:
+        name: mongo_backup
+      when: backup_candidate | bool
+      vars:
+        oplog_flag: "{{ oplog_flag | default('') }}"

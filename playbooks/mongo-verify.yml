@@ -1,0 +1,62 @@
+---
+- name: "Warn user to run with -K if privilege escalation is needed"
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Reminder for privilege escalation
+      debug:
+        msg: |
+          If any required package is missing, you will be prompted for sudo.
+          Run with '-K' if your user is not passwordless sudo.
+          Example:
+            ansible-playbook playbooks/mongo-verify.yml -K
+
+- name: "Check and install MongoDB backup/restore requirements"
+  hosts: mongo_servers
+  gather_facts: no
+  tasks:
+    - name: Check for required tools
+      command: which {{ item }}
+      loop:
+        - mongodump
+        - mongorestore
+        - sshpass
+        - gzip
+        - sftp
+      register: mongo_tools_check
+      ignore_errors: yes
+
+    - name: Set list of missing tools
+      set_fact:
+        missing_tools: "{{ mongo_tools_check.results | selectattr('rc', '!=', 0) | map(attribute='item') | list }}"
+
+    - name: Show missing tools
+      debug:
+        msg: "Missing: {{ missing_tools }}"
+      when: missing_tools | length > 0
+
+    - name: Install missing packages (only if missing)
+      become: yes
+      package:
+        name: "{{ missing_tools }}"
+        state: present
+      when: missing_tools | length > 0
+      register: install_result
+      ignore_errors: yes
+
+    - name: Fail if sudo is required and not provided
+      fail:
+        msg: |
+          Privilege escalation required to install: {{ missing_tools }}.
+          Please re-run this playbook with '-K' to provide your sudo password.
+          Example:
+            ansible-playbook playbooks/mongo-verify.yml -K
+      when:
+        - missing_tools | length > 0
+        - install_result is defined
+        - install_result.failed
+
+    - name: All requirements satisfied!
+      debug:
+        msg: "All required packages are present."
+      when: missing_tools | length == 0 or (install_result is defined and not install_result.failed)

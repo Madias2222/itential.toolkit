@@ -1,0 +1,68 @@
+---
+- name: Detect primary MongoDB host (only needed for replica sets)
+  hosts: mongo_servers
+  gather_facts: false
+
+  tasks:
+    - name: Is this host the primary?
+      shell: >
+        mongosh --quiet --eval 'rs.isMaster().ismaster'
+      register: is_primary_raw
+      failed_when: false  # in case not a replset
+
+    - name: Set primary status fact
+      set_fact:
+        is_primary: "{{ is_primary_raw.stdout | default('') == 'true' }}"
+
+    - name: Set hostvar for primary (for group aggregation)
+      set_fact:
+        primary_hosts_local: "{{ [inventory_hostname] if is_primary else [] }}"
+
+- name: Select and run restore on the primary
+  hosts: mongo_servers
+  gather_facts: false
+
+  tasks:
+    - name: Gather all primary hostnames (run_once)
+      set_fact:
+        group_primary_hosts: >-
+          {{ ansible_play_hosts_all
+             | map('extract', hostvars, 'primary_hosts_local')
+             | sum(start=[]) }}
+      run_once: true
+
+    - name: Debug list of primary hosts
+      debug:
+        var: group_primary_hosts
+      run_once: true
+
+    - name: Mark the primary for restore
+      set_fact:
+        restore_candidate: >-
+          {{
+            (group_primary_hosts | length == 0 and groups['mongo_servers'] | length == 1)
+            or (inventory_hostname == (group_primary_hosts[0] | default('')))
+          }}
+
+    - name: "Debug: Will this host run the restore?"
+      debug:
+        msg: "I am {{ inventory_hostname }}. Am I running the restore? {{ restore_candidate }}"
+      when: restore_candidate | bool
+
+    - name: Check if host is part of replica set
+      shell: >
+        mongosh --quiet --eval "rs.isMaster().setName ? 'true' : 'false'"
+      register: is_replica_set
+
+    - name: Set restore_with_oplog (if applicable)
+      set_fact:
+        restore_with_oplog: >-
+          {{
+            (is_replica_set.stdout == 'true')
+            and (mongo_backup_all | default(false) | bool)
+          }}
+
+    - name: Run restore role (only on primary or single node)
+      include_role:
+        name: mongo_restore
+      when: restore_candidate | bool
